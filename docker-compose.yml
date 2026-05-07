@@ -1,0 +1,158 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: food_talker_postgres
+    environment:
+      POSTGRES_DB: ${DB_NAME:-food_talker}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    env_file:
+      - ./food-talker/.env
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: food_talker_redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    env_file:
+      - ./food-talker/.env
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  reranker:
+    profiles:
+      - reranker
+    build:
+      context: ./food-talker-reranker
+      dockerfile: Dockerfile
+    container_name: food_talker_reranker
+    ports:
+      - "${SERVICE_PORT:-8000}:8000"
+    env_file:
+      - ./food-talker-reranker/.env
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ipc: "host"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  lightrag:
+    profiles:
+      - lightrag
+    container_name: food_talker_lightrag
+    image: ghcr.io/hkuds/lightrag:latest
+    build:
+      context: ./LightRAG
+      dockerfile: Dockerfile
+      tags:
+        - ghcr.io/hkuds/lightrag:latest
+    ports:
+      - "${LIGHTRAG_PORT:-9621}:9621"
+    volumes:
+      - ./LightRAG/data/rag_storage:/app/data/rag_storage
+      - ./LightRAG/data/inputs:/app/data/inputs
+      - ./LightRAG/data/tiktoken:/app/data/tiktoken
+      - ./LightRAG/config.ini:/app/config.ini
+      - ./LightRAG/.env:/app/.env
+    env_file:
+      - ./LightRAG/.env
+    environment:
+      - TIKTOKEN_CACHE_DIR=/app/data/tiktoken
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ipc: "host"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9621/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  qdrant:
+    profiles:
+      - lightrag
+    image: qdrant/qdrant:latest
+    container_name: food_talker_qdrant
+    ports:
+      - "${QDRANT_PORT:-6333}:6333"
+      - "${QDRANT_GRPC_PORT:-6334}:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    env_file:
+      - ./food-talker/.env
+    environment:
+      - QDRANT__SERVICE__HTTP_PORT=6333
+      - QDRANT__SERVICE__GRPC_PORT=6334
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  vllm:
+    profiles:
+      - lightrag
+    image: vllm/vllm-openai:latest
+    container_name: food_talker_vllm
+    command:
+      - --model
+      - BAAI/bge-reranker-v2-m3
+      - --generation-config
+      - auto
+      - --override-generation-config
+      - '{"max_tokens":16384}'
+    ports:
+      - "${VLLM_PORT:-8000}:8000"
+    volumes:
+      - vllm_cache:/root/.cache
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ipc: "host"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/models"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:
+  vllm_cache:
